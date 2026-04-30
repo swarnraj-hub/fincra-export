@@ -1,1 +1,91 @@
+name: Fincra Payment Export
 
+# Triggered by n8n via GitHub API:
+#   POST https://api.github.com/repos/anubhavjain-hue/fincra-export/actions/workflows/fincra-export.yml/dispatches
+#   Headers: Authorization: Bearer <GITHUB_TOKEN>
+#   Body:  { "ref": "main", "inputs": { "start_date": "2026-03-18", "end_date": "2026-03-24" } }
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        type: string
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        type: string
+      s3_enabled:
+        description: "Upload to S3 (true/false)"
+        required: false
+        default: "true"
+        type: string
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright + Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 4. Write .env from GitHub Secrets ─────────────────────────────────────
+      - name: Write .env
+        run: |
+          cat > .env <<EOF
+          FINCRA_USERNAME=${{ secrets.FINCRA_USERNAME }}
+          FINCRA_PASSWORD=${{ secrets.FINCRA_PASSWORD }}
+          FINCRA_TOTP_SECRET=${{ secrets.FINCRA_TOTP_SECRET }}
+          SLACK_BOT_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_ID=${{ secrets.SLACK_USER_ID }}
+          S3_ENABLED=${{ inputs.s3_enabled || 'true' }}
+          S3_BUCKET=${{ secrets.S3_BUCKET }}
+          S3_PAYIN_PREFIX=fincra/collect/raw/
+          S3_PAYOUT_PREFIX=fincra/payout/raw/
+          AWS_DEFAULT_REGION=${{ secrets.AWS_DEFAULT_REGION }}
+          AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EOF
+
+      # ── 5. Run script (xvfb gives a virtual display for Chromium) ─────────────
+      - name: Run Fincra Export
+        run: |
+          xvfb-run --auto-servernum python fincra_export.py \
+            --start_date "${{ inputs.start_date }}" \
+            --end_date   "${{ inputs.end_date }}"
+
+      # ── 6. Upload CSVs as artifact (always, even on failure) ──────────────────
+      - name: Upload CSV artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fincra-${{ inputs.start_date }}-to-${{ inputs.end_date }}
+          path: downloads/*.csv
+          if-no-files-found: warn
+
+      # ── 7. Upload debug screenshots on failure ────────────────────────────────
+      - name: Upload debug screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: |
+            fincra_dbg_*.png
+          if-no-files-found: ignore
