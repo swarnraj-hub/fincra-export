@@ -75,7 +75,6 @@ TOTP_SECRET = os.environ.get("FINCRA_TOTP_SECRET", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_USER_ID   = os.environ.get("SLACK_USER_ID", "")
 
-# S3 config
 S3_ENABLED       = os.environ.get("S3_ENABLED", "false").lower() == "true"
 S3_BUCKET        = os.environ.get("S3_BUCKET", "payout-recon")
 S3_PAYIN_PREFIX  = os.environ.get("S3_PAYIN_PREFIX",  "fincra/collect/raw/")
@@ -86,7 +85,7 @@ DOWNLOAD_DIR = Path("downloads")
 LOGIN_URL    = "https://app.fincra.com/auth/login"
 PAYINS_URL   = "https://app.fincra.com/payins"
 PAYOUTS_URL  = "https://app.fincra.com/payouts"
-BUSINESS_ID  = "6334454b10ed4b05f62955b6"   # Tazapay business ID on Fincra
+BUSINESS_ID  = "6334454b10ed4b05f62955b6"
 
 
 def get_otp() -> str:
@@ -103,10 +102,6 @@ async def ss(page, name: str) -> None:
 # S3 Upload
 # ---------------------------------------------------------------------------
 def upload_to_s3(local_path: Path, prefix: str) -> str:
-    """
-    Upload file to s3://{S3_BUCKET}/{prefix}<filename>
-    Returns the S3 URI.
-    """
     s3_key = f"{prefix}{local_path.name}"
     print(f"[s3] Uploading to s3://{S3_BUCKET}/{s3_key} ...")
     try:
@@ -194,15 +189,12 @@ async def do_login(page) -> None:
     await page.wait_for_timeout(3_000)
     await ss(page, "01_after_submit")
 
-    # 2FA OTP page
     if "twofa" in page.url or await page.locator('input').count() >= 6:
         print("[login] 2FA page detected ...")
         for attempt in range(1, 4):
-            # If already logged in, stop
             if "dashboard" in page.url or "payins" in page.url or "payouts" in page.url:
                 print("[login] Already on dashboard — skipping further OTP attempts.")
                 break
-            # Wait until we have 6 OTP input boxes
             try:
                 await page.wait_for_function("document.querySelectorAll('input').length >= 6", timeout=10_000)
             except Exception:
@@ -237,12 +229,10 @@ async def do_login(page) -> None:
             print(f"[login] Filled {filled}/6 OTP digits")
             if "dashboard" in page.url:
                 break
-            # Try pressing Enter first
             await page.keyboard.press("Enter")
             await page.wait_for_timeout(1_000)
             if "dashboard" in page.url:
                 break
-            # Also try clicking the submit button
             try:
                 submit = page.locator('button:has-text("Verify Account"), button[type="submit"]').first
                 await submit.click(timeout=10_000)
@@ -261,7 +251,6 @@ async def do_login(page) -> None:
 
 
 async def _dismiss_survey(page) -> None:
-    """Dismiss the NPS survey popup or any ReactModal overlay if present."""
     try:
         remind_btn = page.locator('button:has-text("Remind Me Later"), button:has-text("Remind me later")')
         if await remind_btn.count() > 0:
@@ -289,10 +278,9 @@ async def ensure_logged_in(page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Date picker helpers (shared by Pay-Ins and Pay-Outs)
+# Date picker helpers
 # ---------------------------------------------------------------------------
 async def _get_calendar_month_year(page):
-    """Return (month_1indexed, year) from the open calendar's month select."""
     selects = page.locator('select')
     n = await selects.count()
     month = None
@@ -317,7 +305,6 @@ async def _get_calendar_month_year(page):
 
 
 async def _calendar_nav_to(page, target_month: int, target_year: int) -> None:
-    """Navigate the open calendar to the target month using arrow buttons only."""
     for _ in range(24):
         cur_month, cur_year = await _get_calendar_month_year(page)
         if cur_month is None or cur_year is None:
@@ -342,7 +329,6 @@ async def _calendar_nav_to(page, target_month: int, target_year: int) -> None:
 
 
 async def _click_calendar_day(page, day: int) -> bool:
-    """Click a day button in the open calendar. Returns True on success."""
     day_str = str(day)
     all_btns = page.locator('button').filter(has_text=day_str)
     n = await all_btns.count()
@@ -362,13 +348,9 @@ async def _click_calendar_day(page, day: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Pay-Ins Export (via direct API — avoids react-date-range date picker issues)
+# Pay-Ins Export (via direct API)
 # ---------------------------------------------------------------------------
 async def export_payins(page, context) -> Path | None:
-    """
-    Downloads Pay-Ins via the Fincra collections API using the Bearer token
-    from the browser session. Bypasses the buggy UI date range picker.
-    """
     import csv
 
     print(f"\n[payin] Fetching Pay-Ins via API for {START_DATE} -> {END_DATE} ...")
@@ -437,10 +419,6 @@ async def export_payins(page, context) -> Path | None:
 # Pay-Outs Export (unfiltered download + Python date filter)
 # ---------------------------------------------------------------------------
 async def export_payouts(page, context) -> Path | None:
-    """
-    Downloads the full Pay-Outs export (unfiltered) via the Export Table button,
-    then filters rows in Python to keep only records within START_DATE..END_DATE.
-    """
     import csv
 
     print(f"\n[payout] Navigating to {PAYOUTS_URL} ...")
@@ -455,12 +433,24 @@ async def export_payouts(page, context) -> Path | None:
         print("[payout] ERROR: Export Table button not found")
         return None
     await export_table.first.click()
-    await page.wait_for_timeout(800)
+    await ss(page, "21_after_export_click")
+
+    # Wait for CSV dropdown item to be visible before clicking
+    csv_option = page.locator(
+        'li:has-text("CSV"), [role="menuitem"]:has-text("CSV"), '
+        '[role="option"]:has-text("CSV"), .dropdown-item:has-text("CSV")'
+    ).first
+    try:
+        await csv_option.wait_for(state="visible", timeout=10_000)
+        print("[payout] CSV dropdown option visible")
+    except PwTimeout:
+        await ss(page, "22_dropdown_not_visible")
+        raise RuntimeError("CSV dropdown option did not appear after clicking Export Table")
 
     raw_path = DOWNLOAD_DIR / f"_payout_raw_{to_file_date(START_DT)}.csv"
     try:
-        async with page.expect_download(timeout=30_000) as dl_info:
-            await page.locator('text=CSV').click()
+        async with page.expect_download(timeout=60_000) as dl_info:
+            await csv_option.click()
         dl = await dl_info.value
         await dl.save_as(raw_path)
         print(f"[payout] Raw download -> {raw_path.resolve()}")
@@ -572,7 +562,6 @@ async def main() -> None:
         finally:
             await browser.close()
 
-    # --- S3 upload ---
     payin_s3_uri  = None
     payout_s3_uri = None
 
@@ -591,7 +580,6 @@ async def main() -> None:
     else:
         print("[s3] S3_ENABLED=false — skipping upload.")
 
-    # --- Slack summary ---
     lines = [
         f"*Fincra Export Complete*",
         f"Period : `{START_DATE}` → `{END_DATE}`",
